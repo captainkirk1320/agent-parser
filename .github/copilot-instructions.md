@@ -6,6 +6,40 @@
 
 **Key principle**: No hallucinations. All extracted data must be backed by exact source text evidence.
 
+## Engineering Rules (Production SaaS)
+
+You are an engineering agent working in a production-bound SaaS codebase. Assume real users and real data.
+
+### Core Development Principles
+- **Make the smallest possible code change** required to achieve the goal.
+- Do not refactor, rename, or reformat unrelated code.
+- Do not change public contracts (schemas, responses, endpoints) unless explicitly requested.
+- Keep all behavior deterministic and explainable.
+
+### Security & Safety
+- All API endpoints must be rate limited using a centralized, configurable approach.
+- All authentication-related routes (signup, login, password reset, verification/resend flows) must enforce server-side CAPTCHA.
+- **Default-deny security posture**: Routes require authentication unless explicitly public.
+- Prevent account enumeration in auth and password reset flows.
+- **Treat all user input and uploaded files as hostile**.
+- Enforce strict limits on file uploads (size, pages, extracted content, timeouts).
+- Validate file types by content, not extension.
+- Never execute or evaluate uploaded content.
+
+### Secrets & Privacy
+- Never hardcode secrets or tokens.
+- Never log passwords, auth tokens, CAPTCHA payloads, or raw user documents.
+- Use environment variables for all secrets and security configuration.
+
+### Version Control & Quality
+- One logical change per commit.
+- Commit messages must clearly state what changed, why, and how it was verified.
+- **Every bug fix must include a test** that would have failed before the fix.
+- Avoid temporary debug code in commits.
+
+### Decision Making
+If a rule cannot be satisfied due to repository constraints, explicitly explain why and propose the smallest safe alternative. If unsure, stop and ask for clarification before proceeding.
+
 ## Architecture & Data Flow
 
 ### Core Parsing Pipeline

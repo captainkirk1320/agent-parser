@@ -903,6 +903,78 @@ def _normalize_name(name: str) -> str:
     return t
 
 
+def _fix_word_breaks_aggressive(text: str) -> str:
+    """
+    Fix PDF word-break artifacts like "adopti on" -> "adoption", "terri to ries" -> "territories".
+    
+    Strategy: Conservatively merge adjacent tokens when they clearly form a broken word.
+    Avoids merging normal word boundaries.
+    
+    Handles patterns like:
+    - "adopti on" -> "adoption" (prefix + suffix)
+    - "terri to ries" -> "territories" (prefix + short + suffix)
+    - "2 nd" -> "2nd" (digit + letter suffix)
+    - "atta in ment" -> "attainment" (prefix + short + suffix)
+    - "initi a tive" -> "initiative" (prefix + single letter + suffix)
+    
+    This is a more aggressive version of normalize_bullet_text for full paragraph normalization.
+    """
+    if not text or not text.strip():
+        return text
+    
+    tokens = text.split()
+    out = []
+    i = 0
+    
+    # Common suffixes that indicate word breaks (not real word boundaries)
+    broken_suffixes = {
+        'on', 'ing', 'ed', 'tion', 'sion', 'ment', 'ity', 'ies', 'able',
+        'ness', 'ous', 'ful', 'less', 'ly', 'er', 'est', 'en', 'ist',
+        'nd', 'st', 'rd', 'th',  # ordinal suffixes like 2nd, 1st, etc.
+        'tive', 'ive',  # for initiative-like words
+    }
+    
+    while i < len(tokens):
+        merged = False
+        
+        # Try 3-token merge: "terri to ries" -> "territories" or "initi a tive" -> "initiative"
+        # Pattern: tok1 + short-token(1-2 chars) tok2 + tok3(suffix or suffix-like)
+        if i + 2 < len(tokens):
+            tok1, tok2, tok3 = tokens[i], tokens[i+1], tokens[i+2]
+            # Merge if middle token is very short (1-2 chars) AND last token looks like a suffix
+            # BUT: Don't merge if tok1 or tok2 contains a digit (not a word-break artifact)
+            if (len(tok2) <= 2 and 
+                (tok3.lower() in broken_suffixes or tok3.lower().endswith(('ies', 'ment', 'tion', 'tive', 'ive'))) and
+                not any(c.isdigit() for c in tok1) and  # Skip if tok1 contains a digit
+                not any(c.isdigit() for c in tok2)):    # Skip if tok2 is a digit or contains one
+                merged_3 = tok1 + tok2 + tok3
+                out.append(merged_3)
+                i += 3
+                merged = True
+        
+        if not merged and i + 1 < len(tokens):
+            tok1, tok2 = tokens[i], tokens[i+1]
+            
+            # Case 1: tok2 is a clear suffix (very short, in our broken_suffixes set)
+            if tok2.lower() in broken_suffixes:
+                # Merge if tok1 ends with a vowel (suggests word break, not boundary)
+                if tok1 and tok1[-1].lower() in 'aeiou':
+                    merged_2 = tok1 + tok2
+                    out.append(merged_2)
+                    i += 2
+                    merged = True
+                # Special case: DISABLE digit + ordinal suffix merging
+                # Reason: "2 nd" should be "2nd", but "Q2 2 nd" shouldn't become "Q22nd"
+                # The heuristic is too error-prone. Leave these for manual post-processing.
+                # elif tok1[-1].isdigit() and tok2.lower() in {'nd', 'st', 'rd', 'th'}:
+        
+        if not merged:
+            out.append(tokens[i])
+            i += 1
+    
+    return " ".join(out)
+
+
 # ===== EXPERIENCE PARSING PATTERNS =====
 
 # Detect experience section headers (including variants like "Career Experience", "Work History", etc.)
@@ -911,16 +983,18 @@ EXPERIENCE_HEADER_RE = re.compile(
     re.IGNORECASE
 )
 
-# Single-line format: "Company: Title: Location" or "Company / Title / Location"
+# Single-line format: "Company: Title: Location" (colon-delimited only)
+# Do NOT match slashes to avoid conflict with date formats like "02/2019 - 04/2025"
 # Example: "ACME CORP: TERRITORY MANAGER: NEW YORK"
 SINGLE_LINE_EXPERIENCE_RE = re.compile(
-    r"^(.+?)(?::\s*|/\s*)(.+?)(?::\s*|/\s*)(.+)$"
+    r"^(.+?):\s*(.+?):\s*(.+)$"
 )
 
-# Two-part format: "Company: Job Title" (without location, or with trailing colon)
-# Examples: "NEODENT: TERRITORYMANAGEROREGON:" or "SOUTHERN GLAZER'S: KEY ACCOUNT MANAGER"
+# Two-part format: "Company: Job Title" (colon-delimited only)
+# Do NOT match slashes to avoid conflict with date formats like "02/2019 - 04/2025"
+# Examples: "NEODENT: TERRITORY MANAGER" or "SOUTHERN GLAZER'S: KEY ACCOUNT MANAGER"
 TWO_PART_EXPERIENCE_RE = re.compile(
-    r"^(.+?)(?::\s*|/\s*)([A-Z][A-Za-z\s&'-]*)(?::\s*)?$"
+    r"^(.+?):\s*([A-Z][A-Za-z\s&'-]*)(?::\s*)?$"
 )
 
 # Date patterns (relaxed, capture many formats)
@@ -1262,18 +1336,13 @@ def _group_experience_entries(
         elif re.match(r'^\d{1,2}[-/]\d{1,4}\s*(?:-|–|to)\s*(?:\d{1,2}[-/]\d{1,4}|Present|Current)', t, re.IGNORECASE):
             # This is a date range line - attach to current entry
             is_new_entry_start = False
-        # Skip job title headers (they belong to current company entry in H3 format)
-        # Examples: "BUSINESS DEVELOPMENT MANAGER", "SENIOR ACCOUNT MANAGER                01/2023 - 12/2024"
-        # These should be attached to the company header that precedes them
-        elif current_entry and _is_job_title_header(t):
-            # This is a job title header - attach to current entry (the company header)
-            is_new_entry_start = False
         # Pattern 0: H2/H3 Hierarchical Format
         # Detect "Company, Location" as start of new entry
         elif _is_company_with_location_header(t):
             is_new_entry_start = True
         # Pattern 1: Single-line format (Company: Title: Location)
-        elif SINGLE_LINE_EXPERIENCE_RE.match(t):
+        # IMPORTANT: Must have colons to distinguish from job title headers with dates
+        elif ":" in t and SINGLE_LINE_EXPERIENCE_RE.match(t):
             is_new_entry_start = True
         # Pattern 1b: Two-part format (Company: Job Title with no location)
         # This catches cases like "NEODENT: TERRITORYMANAGEROREGON:" or "SOUTHERN GLAZER'S: KEY ACCOUNT MANAGER"
@@ -1288,17 +1357,37 @@ def _group_experience_entries(
                 is_new_entry_start = True
         # Pattern 2: Company name with location (e.g., "Bausch & Lomb, Phoenix Valley, AZ")
         # OR Company with location + dates (e.g., "Google, Mountain View, CA, 2020 – Present")
-        # These can indicate a new entry IF they don't belong to current entry.
-        # However, ONLY if we already have an entry in progress (otherwise it's an orphan location).
+        # These can indicate a new entry IF they have a company name before the location.
+        # IMPORTANT: Standalone location lines in the middle of descriptions should NOT split entries
         elif current_entry and _extract_location_from_line(t) is not None and not BULLET_RE.match(t) and len(t) < 200:
-            # Location line that could start a new entry, but ONLY if current entry is complete
-            # We consider an entry "complete" if it already has a location
-            prev_text = " ".join([text for _, text in current_entry])
-            already_has_location = _extract_location_from_line(prev_text) is not None
+            # Check if this looks like a company+location header or just a location
+            # Company headers have a company name before the location
+            is_company_location = _is_company_with_location_header(t)
             
-            if already_has_location:
-                # Current entry already has a location, so this location line starts a new entry
+            if is_company_location:
+                # This looks like a new company+location header, so start a new entry
                 is_new_entry_start = True
+        # Pattern 3: Job title header (all-caps or Title Case with optional dates)
+        # This indicates a new job entry within the same company, but ONLY if we already have
+        # a company + job title + more content (indicating we've moved past the first job)
+        # Check if current_entry already contains a job title line (contains only title words + dates, no colons/commas)
+        # and additional content after that job title (descriptions, achievements, etc.)
+        elif current_entry and _is_job_title_header(t):
+            # Check if current entry already has a complete job title with content after it
+            # This is true if we've seen: [company, description, job_title, dates/description, bullet/achievement]
+            # We need at least: company + job_title_with_dates + some_content = 4+ lines minimum
+            has_prior_job_title = False
+            if len(current_entry) >= 4:  # At minimum: company + job_title + dates + (description or bullet)
+                # Check if any earlier line looks like a job title header
+                for earlier_locator, earlier_text in current_entry:
+                    if _is_job_title_header(earlier_text.strip()):
+                        has_prior_job_title = True
+                        break
+            
+            if has_prior_job_title:
+                # This is a second job title, so start a new entry
+                is_new_entry_start = True
+            # else: this is the first job title in H3 format, keep it attached to company header
         
         if is_new_entry_start and current_entry:
             # Start a new entry, save the old one
@@ -1333,7 +1422,7 @@ def _parse_experience_entry(entry_lines: List[Tuple[str, str]]) -> Dict[str, any
       - Line 2: Job Title, Location, or Dates
       - Line 3+: Achievements/bullets/description
     
-    Returns dict with keys: company, job_title, location, start_date, end_date, achievements (list)
+    Returns dict with keys: company, job_title, location, start_date, end_date, company_description, job_description, achievements (list)
     """
     experience = {
         "company": None,
@@ -1341,6 +1430,8 @@ def _parse_experience_entry(entry_lines: List[Tuple[str, str]]) -> Dict[str, any
         "location": None,
         "start_date": None,
         "end_date": None,
+        "company_description": None,
+        "job_description": None,
         "achievements": []
     }
     
@@ -1363,6 +1454,13 @@ def _parse_experience_entry(entry_lines: List[Tuple[str, str]]) -> Dict[str, any
         if parsed["company"] or parsed["job_title"]:
             experience.update(parsed)
             idx += 1
+        # CRITICAL: Check if line 1 is a job title header (indicates continuation, no company)
+        # This happens in H2/H3 format with multiple jobs at same company
+        elif _is_job_title_header(t):
+            # First line is a job title, not a company
+            # This means it's a continuation entry (multiple jobs under same company)
+            # Leave company blank and jump to job title parsing
+            pass  # Don't increment idx yet; process as job title in next section
         else:
             # Line 1 is likely company name (possibly with location)
             # Check if it has a location
@@ -1380,23 +1478,34 @@ def _parse_experience_entry(entry_lines: List[Tuple[str, str]]) -> Dict[str, any
                 experience["company"] = t.title() if t.isupper() else t
             idx += 1
     
-    # LINE 2: Look for job title (H3 header), or dates/location
-    if idx < len(entry_lines):
+    # LINE 2: Collect company description lines, then look for job title (H3 header)
+    # In H2/H3 format, description lines appear between company header and job title
+    # Strategy: Collect ALL non-empty, non-bullet lines until we hit the job title header
+    company_desc_lines = []
+    while idx < len(entry_lines):
         locator, text = entry_lines[idx]
         t = text.strip()
         
+        if not t:
+            # Skip empty lines
+            idx += 1
+            continue
+        
+        # CRITICAL: Stop immediately on bullet lines (they are achievements, not descriptions)
+        if BULLET_RE.match(text):
+            break
+        
         # Check if this is an H3-like job title header (all-caps or Title Case job title)
-        is_job_title_header = _is_job_title_header(t)
-        
-        # Skip company description lines (usually longer, mixed case)
-        is_description = (
-            len(t) > 120 or  # Too long for a job title line
-            (not t.isupper() and not re.match(r"^[A-Z][A-Za-z\s,-]*$", t) and not any(c.isdigit() for c in t))
-        )
-        
-        if is_job_title_header:
-            # This is an H3-like job title header - may include dates on same line
-            # Extract dates from this line if present
+        if _is_job_title_header(t):
+            # Found the job title! Save accumulated description and break
+            if company_desc_lines:
+                raw_desc = " ".join(company_desc_lines)
+                # Normalize to fix PDF corruption artifacts (adopti on -> adoption, 2 nd -> 2nd)
+                normalized = _fix_word_breaks_aggressive(raw_desc)
+                normalized = normalize_bullet_text(normalized)
+                experience["company_description"] = normalized
+            
+            # Extract dates from this job title line if present
             dates = _extract_date_range(t)
             if dates[0]:
                 experience["start_date"], experience["end_date"] = dates
@@ -1436,29 +1545,59 @@ def _parse_experience_entry(entry_lines: List[Tuple[str, str]]) -> Dict[str, any
                         experience["location"] = _format_location(location_text)
                     
                     idx += 1
-        elif not is_description and (any(c.isupper() for c in t) or any(c.isdigit() for c in t)):
-            # This is a regular job title with dates line (mixed format)
-            # Extract dates
-            dates = _extract_date_range(t)
-            if dates[0]:
-                experience["start_date"], experience["end_date"] = dates
-            
-            # Extract location - prefer this one over the single-line format version
-            # because it's usually more complete (e.g., "New York, New York" vs "NewYork")
-            location_text = _extract_location_from_line(t)
-            if location_text:
-                experience["location"] = _format_location(location_text)
-            
-            # Extract job title (remove dates) - only if we don't already have one
-            if not experience["job_title"]:
-                job_title = re.sub(r'\d{1,2}[-/]?\d{1,2}[-/]?\d{2,4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}|\d{4}|\bPresent\b|\bCurrent\b', '', t, flags=re.IGNORECASE)
-                job_title = re.sub(r'[-–]|to\b', '', job_title, flags=re.IGNORECASE)
-                job_title = re.sub(r'\s+', ' ', job_title).strip()
-                
-                if job_title and len(job_title) > 2:
-                    experience["job_title"] = job_title.title() if job_title.isupper() else job_title
-            
+            break  # Exit while loop after finding job title
+        elif any(c.isupper() for c in t) or any(c.isdigit() for c in t):
+            # This is a company description line (mixed case, contains text, not a job title)
+            # Collect it as part of company description
+            company_desc_lines.append(t)
             idx += 1
+        else:
+            # Skip other lines (pure lowercase, etc.)
+            idx += 1
+    
+    # JOB DESCRIPTION: Collect non-bullet lines after job title but before achievements
+    # Strategy: Collect ALL non-bullet, non-header lines as job description until we hit a bullet point
+    # This is more robust to PDF corruption and varying line lengths
+    job_desc_lines = []
+    temp_idx = idx
+    while temp_idx < len(entry_lines):
+        check_locator, check_text = entry_lines[temp_idx]
+        check_t = check_text.strip()
+        
+        if not check_t:
+            # Skip empty lines but keep looking for more content
+            temp_idx += 1
+            continue
+        
+        # Stop when we hit a bullet (achievements start)
+        if BULLET_RE.match(check_text):
+            break
+        
+        # Stop if it's a header line (section header like EDUCATION, SKILLS)
+        if _is_header_line(check_text):
+            break
+        
+        # CRITICAL: Don't stop on company header detection if we haven't found any job description yet
+        # This prevents misinterpreting continuation text as a new entry
+        is_company_header = _is_company_with_location_header(check_t)
+        if is_company_header and job_desc_lines:
+            # We already have job description, so this is likely a new entry
+            break
+        
+        # Collect any non-empty, non-header line as job description
+        # (unless it looks like a company header and we already have description)
+        if not is_company_header:
+            job_desc_lines.append(check_t)
+            idx = temp_idx + 1  # Advance idx past job description
+        
+        temp_idx += 1
+    
+    if job_desc_lines:
+        raw_job_desc = " ".join(job_desc_lines)
+        # Normalize to fix PDF corruption artifacts (adopti on -> adoption, 2 nd -> 2nd)
+        normalized = _fix_word_breaks_aggressive(raw_job_desc)
+        normalized = normalize_bullet_text(normalized)
+        experience["job_description"] = normalized
     
     # Remaining lines are likely achievements/description
     # Handle wrapped bullet lines: if a line doesn't start with a bullet, it's a continuation
@@ -1470,6 +1609,22 @@ def _parse_experience_entry(entry_lines: List[Tuple[str, str]]) -> Dict[str, any
         if not t:  # Skip empty lines
             continue
         
+        # CRITICAL: Stop if we encounter another job title header (new job)
+        # This prevents the next job from being included in achievements
+        if _is_job_title_header(t):
+            # Save current achievement before stopping
+            if current_achievement and len(current_achievement) > 10 and len(current_achievement) < 500:
+                # Fix word-break artifacts first (2 nd -> 2nd, adopti on -> adoption)
+                current_achievement = _fix_word_breaks_aggressive(current_achievement)
+                current_achievement = normalize_bullet_text(current_achievement)
+                has_character_fragmentation = bool(re.search(r'\b[a-z]\s+[a-z]\s+[a-z]\b', current_achievement))
+                if has_character_fragmentation:
+                    current_achievement = _normalize_achievement_intelligently(current_achievement)
+                    current_achievement = normalize_bullet_text(current_achievement)
+                experience["achievements"].append(current_achievement)
+            # Stop processing - next entry should be handled by entry grouping
+            break
+
         # Check if this line starts with a bullet marker
         is_bullet_line = bool(BULLET_RE.match(text))
         
@@ -1485,6 +1640,15 @@ def _parse_experience_entry(entry_lines: List[Tuple[str, str]]) -> Dict[str, any
         if _extract_location_from_line(t) and len(t) < 60 and ":" not in t and not any(c.isdigit() for c in t):
             continue
         
+        # CRITICAL: Skip description text that appears before achievements
+        # If this is a non-bullet line and we haven't found any achievements yet,
+        # and it looks like flowing prose (no sentence-ending bullet pattern),
+        # skip it as a job description
+        if (not is_bullet_line and not current_achievement and 
+            len(t) > 80 and not re.match(r'^[•\-*].*[.:;!?]$', t)):
+            # This looks like a job description (long paragraph), skip it
+            continue
+        
         # Remove bullet formatting
         achievement = BULLET_RE.sub("", t).strip()
         
@@ -1496,7 +1660,9 @@ def _parse_experience_entry(entry_lines: List[Tuple[str, str]]) -> Dict[str, any
         
         # This is a new bullet line - save the previous achievement if valid
         if current_achievement and len(current_achievement) > 10 and len(current_achievement) < 500:
-            # Apply targeted glue-word fixes FIRST
+            # Fix word-break artifacts first (2 nd -> 2nd, adopti on -> adoption)
+            current_achievement = _fix_word_breaks_aggressive(current_achievement)
+            # Apply targeted glue-word fixes
             current_achievement = normalize_bullet_text(current_achievement)
             
             # Check for character fragmentation
@@ -1518,7 +1684,9 @@ def _parse_experience_entry(entry_lines: List[Tuple[str, str]]) -> Dict[str, any
     
     # Don't forget the last achievement
     if current_achievement and len(current_achievement) > 10 and len(current_achievement) < 500:
-        # Apply targeted glue-word fixes FIRST
+        # Fix word-break artifacts first (2 nd -> 2nd, adopti on -> adoption)
+        current_achievement = _fix_word_breaks_aggressive(current_achievement)
+        # Apply targeted glue-word fixes
         current_achievement = normalize_bullet_text(current_achievement)
         
         # Check for character fragmentation
