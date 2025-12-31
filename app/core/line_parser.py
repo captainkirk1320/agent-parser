@@ -1302,6 +1302,7 @@ def _group_experience_entries(
     """
     entries: List[List[Tuple[str, str]]] = []
     current_entry: List[Tuple[str, str]] = []
+    last_h2_company_header: Tuple[str, str] | None = None  # Track last H2 company header for multi-job entries
     
     for idx in range(section_start + 1, len(lines)):
         locator, text = lines[idx]
@@ -1340,10 +1341,14 @@ def _group_experience_entries(
         # Detect "Company, Location" as start of new entry
         elif _is_company_with_location_header(t):
             is_new_entry_start = True
+            # Remember this H2 company header for subsequent H3 job titles
+            last_h2_company_header = (locator, text)
         # Pattern 1: Single-line format (Company: Title: Location)
         # IMPORTANT: Must have colons to distinguish from job title headers with dates
         elif ":" in t and SINGLE_LINE_EXPERIENCE_RE.match(t):
             is_new_entry_start = True
+            # Clear H2 cache - we're in a different format now
+            last_h2_company_header = None
         # Pattern 1b: Two-part format (Company: Job Title with no location)
         # This catches cases like "NEODENT: TERRITORYMANAGEROREGON:" or "SOUTHERN GLAZER'S: KEY ACCOUNT MANAGER"
         elif TWO_PART_EXPERIENCE_RE.match(t):
@@ -1355,6 +1360,8 @@ def _group_experience_entries(
             if len(company_part) < 100 and (company_part.isupper() or any(w[0].isupper() for w in company_part.split())):
                 # Non-bullet line with company:role format -> new entry
                 is_new_entry_start = True
+                # Clear H2 cache - we're in a different format now
+                last_h2_company_header = None
         # Pattern 2: Company name with location (e.g., "Bausch & Lomb, Phoenix Valley, AZ")
         # OR Company with location + dates (e.g., "Google, Mountain View, CA, 2020 – Present")
         # These can indicate a new entry IF they have a company name before the location.
@@ -1367,12 +1374,13 @@ def _group_experience_entries(
             if is_company_location:
                 # This looks like a new company+location header, so start a new entry
                 is_new_entry_start = True
+                # Clear H2 cache - this is a new company, not part of previous H2/H3 structure
+                last_h2_company_header = None
         # Pattern 3: Job title header (all-caps or Title Case with optional dates)
-        # This indicates a new job entry within the same company, but ONLY if we already have
-        # a company + job title + more content (indicating we've moved past the first job)
-        # Check if current_entry already contains a job title line (contains only title words + dates, no colons/commas)
-        # and additional content after that job title (descriptions, achievements, etc.)
-        elif current_entry and _is_job_title_header(t):
+        # This indicates a new job entry within the same company, but ONLY if:
+        # 1. We have a cached H2 company header (indicating H2/H3 format)
+        # 2. Current entry already has a complete job title with content
+        elif current_entry and _is_job_title_header(t) and last_h2_company_header:
             # Check if current entry already has a complete job title with content after it
             # This is true if we've seen: [company, description, job_title, dates/description, bullet/achievement]
             # We need at least: company + job_title_with_dates + some_content = 4+ lines minimum
@@ -1385,14 +1393,42 @@ def _group_experience_entries(
                         break
             
             if has_prior_job_title:
-                # This is a second job title, so start a new entry
+                # This is a second job title under the same H2 company, so start a new entry
+                # CRITICAL: Prepend the cached H2 company header to ensure company name is carried forward
                 is_new_entry_start = True
             # else: this is the first job title in H3 format, keep it attached to company header
+        # Pattern 4: Simple multi-line format without H2 header
+        # Detect when we have a completed entry (with bullets/achievements) followed by a new company/job line
+        # This handles simple formats like:
+        #   TECH CORP
+        #   Software Engineer
+        #   ● Achievements
+        #   SALES CORP   <- This should start a new entry
+        #   Account Manager
+        elif current_entry and _is_company_or_job_line(t) and not BULLET_RE.match(t):
+            # Check if current entry has achievements/bullets (indicating it's complete)
+            has_achievements = any(BULLET_RE.match(line_text) for _, line_text in current_entry)
+            # If we have achievements, this new company/job line likely starts a new entry
+            if has_achievements and len(current_entry) >= 3:  # At least company + job + achievement
+                is_new_entry_start = True
+                # Clear H2 cache since we're not in H2/H3 format
+                last_h2_company_header = None
         
         if is_new_entry_start and current_entry:
             # Start a new entry, save the old one
             entries.append(current_entry)
-            current_entry = [(locator, text)]
+            # If starting a new H3 job title entry and we have a cached H2 company header, prepend it
+            # ONLY prepend if this is actually a job title header (not a different format)
+            if _is_job_title_header(t) and last_h2_company_header and not _is_company_with_location_header(t):
+                current_entry = [last_h2_company_header, (locator, text)]
+            else:
+                current_entry = [(locator, text)]
+                # If this is a new H2 company header, update the cache
+                if _is_company_with_location_header(t):
+                    last_h2_company_header = (locator, text)
+                # Otherwise, clear the cache (we're in a different format)
+                else:
+                    last_h2_company_header = None
         else:
             current_entry.append((locator, text))
     
@@ -1454,10 +1490,22 @@ def _parse_experience_entry(entry_lines: List[Tuple[str, str]]) -> Dict[str, any
         if parsed["company"] or parsed["job_title"]:
             experience.update(parsed)
             idx += 1
-        # CRITICAL: Check if line 1 is a job title header (indicates continuation, no company)
-        # This happens in H2/H3 format with multiple jobs at same company
-        elif _is_job_title_header(t):
-            # First line is a job title, not a company
+        # CRITICAL: Check if line 1 is a company with location (H2 header)
+        # This happens in H2/H3 format - the H2 header should have been prepended by grouping logic
+        elif _is_company_with_location_header(t):
+            # This is an H2 company header
+            location_text = _extract_location_from_line(t)
+            if location_text:
+                experience["location"] = _format_location(location_text)
+                loc_start = t.find(location_text)
+                company_part = t[:loc_start].strip().rstrip(",")
+                if company_part:
+                    experience["company"] = company_part.title() if company_part.isupper() else company_part
+            idx += 1
+        # Check if line 1 is a job title header ONLY if line 2 also exists and looks like it could be in H3 format
+        # (This prevents treating standalone company names like "TECH CORP" as job titles)
+        elif _is_job_title_header(t) and len(entry_lines) >= 2 and _is_company_with_location_header(entry_lines[0][1]):
+            # First line is a job title, not a company (H3 format with H2 header on line 0)
             # This means it's a continuation entry (multiple jobs under same company)
             # Leave company blank and jump to job title parsing
             pass  # Don't increment idx yet; process as job title in next section

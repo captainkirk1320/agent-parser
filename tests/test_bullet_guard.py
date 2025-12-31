@@ -124,6 +124,10 @@ Account Manager
     for exp in experiences:
         company = exp.get("company", "")
         
+        # Skip entries with no company (e.g., continuation entries in multi-job format)
+        if not company:
+            continue
+        
         # Company names should never start with bullet characters
         assert not company.startswith("●"), f"Experience company starts with bullet: {company}"
         assert not company.startswith("•"), f"Experience company starts with bullet: {company}"
